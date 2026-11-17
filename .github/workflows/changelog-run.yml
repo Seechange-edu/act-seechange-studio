@@ -113,7 +113,7 @@ jobs:
           METER_ENABLED=$(param /api-meter/prod/GLOBAL_ENABLED)
           if [ "$METER_ENABLED" != false ]; then
             METER_URL=$(param /api-meter/prod/PROXY_URL_PROD)
-            for PAIR in "ai-english-gym|INGEST_KEY_AI_ENGLISH_GYM" "cms|INGEST_KEY_CMS"; do
+            for PAIR in "ai-english-gym|INGEST_KEY_AI_ENGLISH_GYM" "cms|INGEST_KEY_CMS" "video-studio|INGEST_KEY_VIDEO_STUDIO"; do
               IFS='|' read -r APP NAME <<< "$PAIR"
               KEY=$(param "/api-meter/prod/${NAME}")
               [ -n "$KEY" ] || continue
