@@ -1,0 +1,57 @@
+name: User changelog
+
+run-name: User changelog · seechange-studio ${{ github.event.client_payload.tag }}
+
+# Started from seechange-studio's changelog.yml via repository_dispatch.
+# This repository is public: the notes are written only into the private release.
+on:
+  repository_dispatch:
+    types: [changelog]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.client_payload.tag }}
+      SCOPE: ${{ github.event.client_payload.scope }}
+      PREVIOUS: ${{ github.event.client_payload.previous }}
+    outputs:
+      tag: ${{ steps.ok.outputs.tag }}
+      scope: ${{ steps.ok.outputs.scope }}
+      previous: ${{ steps.ok.outputs.previous }}
+    steps:
+      - name: Check the request
+        id: ok
+        run: |
+          for NAME in "$TAG" "$PREVIOUS"; do
+            [ -z "$NAME" ] || [[ "$NAME" =~ ^[A-Za-z0-9._-]+$ ]] || {
+              echo "::error::'${NAME}' is not a tag name."
+              exit 1
+            }
+          done
+          [ -n "$TAG" ] || { echo "::error::The request names no tag."; exit 1; }
+          case "$SCOPE" in
+            single) ;;
+            *) echo "::error::Scope '${SCOPE}' is not one seechange-studio can take (single)."; exit 1 ;;
+          esac
+          {
+            echo "tag=$TAG"
+            echo "scope=$SCOPE"
+            echo "previous=$PREVIOUS"
+          } >> "$GITHUB_OUTPUT"
+
+  changelog:
+    needs: check
+    permissions:
+      id-token: write
+      contents: read
+    uses: ./.github/workflows/changelog-run.yml
+    with:
+      source_repo: Seechange-edu/seechange-studio
+      tag: ${{ needs.check.outputs.tag }}
+      scope: ${{ needs.check.outputs.scope }}
+      previous: ${{ needs.check.outputs.previous }}
+    secrets: inherit
