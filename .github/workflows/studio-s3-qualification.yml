@@ -2,17 +2,6 @@ name: Studio standby S3 qualification
 
 on:
   workflow_dispatch:
-    inputs:
-      multipart_request:
-        description: Base64 JSON for a private multipart qualification
-        type: string
-        required: false
-        default: ''
-      reply_certificate:
-        description: Base64 PEM certificate for the encrypted result
-        type: string
-        required: false
-        default: ''
 
 permissions: {}
 
@@ -22,7 +11,7 @@ concurrency:
 
 jobs:
   qualify:
-    if: github.repository == 'Seechange-edu/act-seechange-studio' && github.ref == 'refs/heads/main' && inputs.multipart_request == ''
+    if: github.repository == 'Seechange-edu/act-seechange-studio' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -105,57 +94,3 @@ jobs:
                 print(json.dumps({"stage": stage, "error": code}), flush=True)
                 sys.exit(1)
             PY
-
-  multipart:
-    if: github.repository == 'Seechange-edu/act-seechange-studio' && github.ref == 'refs/heads/codex/standby-multipart-qualification' && inputs.multipart_request != ''
-    runs-on: ubuntu-latest
-    timeout-minutes: 12
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          persist-credentials: false
-      - name: Validate request and prepare probe
-        shell: bash
-        env:
-          REQUEST: ${{ inputs.multipart_request }}
-          CERTIFICATE: ${{ inputs.reply_certificate }}
-        run: |
-          set -euo pipefail
-          for encoded in "$REQUEST" "$CERTIFICATE"; do
-            if [[ ! "$encoded" =~ ^[A-Za-z0-9+/=]+$ ]] || (( ${#encoded} > 16000 )); then
-              echo "Expected a bounded, single-line base64 value." >&2
-              exit 1
-            fi
-            printf '%s' "$encoded" | base64 -d >/dev/null
-          done
-          {
-            printf 'STUDIO_MP_REQUEST=%s\n' "$REQUEST"
-            printf 'STUDIO_MP_CERT=%s\n' "$CERTIFICATE"
-            printf 'STUDIO_MP_SCRIPT=%s\n' "$(base64 -w0 scripts/studio_multipart_probe.py)"
-          } >> "$GITHUB_ENV"
-      - name: Run multipart probe with the standby container's S3 identity
-        uses: appleboy/ssh-action@7eaf76671a0d7eec5d98ee897acda4f968735a17 # v1.2.0
-        env:
-          STUDIO_PROBE_BUCKET: ${{ vars.STUDIO_PROBE_BUCKET }}
-        with:
-          host: video-studio-prod.seechange-edu.com
-          username: ${{ vars.REMOTE_USER }}
-          key: ${{ secrets.REMOTE_SSH_KEY }}
-          envs: STUDIO_PROBE_BUCKET,STUDIO_MP_REQUEST,STUDIO_MP_CERT,STUDIO_MP_SCRIPT
-          command_timeout: 10m
-          script: |
-            set -euo pipefail
-            umask 077
-            work="$(mktemp -d)"
-            trap 'rm -f -- "$work/cert.pem" "$work/probe.py" "$work/reply.der"; rmdir -- "$work"' EXIT
-            printf '%s' "$STUDIO_MP_CERT" | base64 -d > "$work/cert.pem"
-            openssl x509 -in "$work/cert.pem" -noout -checkend 0 >/dev/null
-            printf '%s' "$STUDIO_MP_SCRIPT" | base64 -d > "$work/probe.py"
-            status=0
-            docker exec -i -w /app seechange-studio python - "$STUDIO_PROBE_BUCKET" "$STUDIO_MP_REQUEST" \
-              < "$work/probe.py" | openssl cms -encrypt -binary -aes256 -outform DER \
-              -out "$work/reply.der" "$work/cert.pem" || status=$?
-            printf 'STUDIO_MULTIPART_ENCRYPTED=%s\n' "$(base64 -w0 "$work/reply.der")"
-            exit "$status"
