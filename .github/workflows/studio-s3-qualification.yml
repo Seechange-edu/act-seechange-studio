@@ -1,0 +1,96 @@
+name: Studio standby S3 qualification
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: studio-standby-s3-qualification
+  cancel-in-progress: false
+
+jobs:
+  qualify:
+    if: github.repository == 'Seechange-edu/act-seechange-studio' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Run S3 check inside the existing Studio container
+        uses: appleboy/ssh-action@7eaf76671a0d7eec5d98ee897acda4f968735a17 # v1.2.0
+        env:
+          STUDIO_PROBE_BUCKET: ${{ vars.STUDIO_PROBE_BUCKET }}
+        with:
+          host: video-studio-prod.seechange-edu.com
+          username: ${{ vars.REMOTE_USER }}
+          key: ${{ secrets.REMOTE_SSH_KEY }}
+          envs: STUDIO_PROBE_BUCKET
+          command_timeout: 2m
+          script: |
+            set -eu
+            docker exec -i -w /app seechange-studio python - "$STUDIO_PROBE_BUCKET" <<'PY'
+            import hashlib
+            import json
+            import os
+            from pathlib import Path
+            import re
+            import sys
+            from tempfile import TemporaryDirectory
+            from types import SimpleNamespace
+            from urllib.request import urlopen
+            from uuid import uuid4
+
+            from studio_control.ssm_secrets import load_profile_env
+            from studio_control.storage import Storage
+
+            bucket = sys.argv[1]
+            if not re.fullmatch(r"seechange-video-studio-prod-[0-9]{12}-ap-east-1-an", bucket):
+                sys.exit("Set STUDIO_PROBE_BUCKET to the dedicated Hong Kong Studio bucket.")
+
+            stage = "standby"
+            try:
+                with urlopen("http://127.0.0.1:8080/readyz", timeout=5) as body:
+                    readiness = json.load(body)
+                if readiness.get("dispatch_enabled") is not False or readiness.get("cutover_ready") is not False:
+                    sys.exit("Expected dispatch off and cutover disabled.")
+
+                stage = "runtime_profile"
+                load_profile_env()
+                settings = SimpleNamespace(bucket=bucket, region="ap-east-1", prefix="studio-storage")
+                if os.environ.get("STUDIO_S3_ACCESS_KEY_PARAMETER") or os.environ.get("STUDIO_S3_SECRET_KEY_PARAMETER"):
+                    from studio_control.ssm_secrets import load_s3_credentials
+                    storage = Storage(settings, credentials=load_s3_credentials())
+                else:
+                    storage = Storage(settings)
+
+                stage = "bucket_versioning"
+                if storage.client().get_bucket_versioning(Bucket=bucket).get("Status") != "Enabled":
+                    sys.exit("S3 did not report versioning enabled.")
+
+                stage = "upload_and_verify"
+                key = f"{settings.prefix}/private/qualification/{uuid4().hex}.txt"
+                print(json.dumps({"test_key": key}), flush=True)
+                with TemporaryDirectory(prefix="studio-s3-qualification-") as directory:
+                    path = Path(directory) / "probe.txt"
+                    payload = b"Studio standby S3 qualification\n"
+                    path.write_bytes(payload)
+                    artifact = storage.put_file(path, key, "text/plain")
+                print(json.dumps({"s3_test_version": artifact["version_id"]}), flush=True)
+
+                stage = "exact_version_read"
+                response = storage.open_blob(artifact)
+                with response["Body"] as body:
+                    checksum = hashlib.sha256(body.read(len(payload) + 1)).hexdigest()
+                if response.get("VersionId") != artifact["version_id"] or checksum != artifact["sha256"]:
+                    sys.exit("S3 read returned a different version or SHA-256.")
+                print(json.dumps({"put_ok": True, "version_read_ok": True, "checksum_match": True}))
+            except Exception as exc:
+                code = type(exc).__name__
+                while exc is not None:
+                    aws_code = getattr(exc, "response", {}).get("Error", {}).get("Code")
+                    if aws_code:
+                        code = aws_code
+                        break
+                    exc = exc.__cause__ or exc.__context__
+                print(json.dumps({"stage": stage, "error": code}), flush=True)
+                sys.exit(1)
+            PY
