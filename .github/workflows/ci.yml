@@ -101,19 +101,71 @@ jobs:
           key: ${{ secrets.REMOTE_SSH_KEY }}
           envs: ECR_REGISTRY,ECR_TOKEN,IMAGE_URI
           script: |
+            set -eu
             echo "${ECR_TOKEN}" | docker login --username AWS --password-stdin "${ECR_REGISTRY}"
             docker pull "${IMAGE_URI}"
             DATA_DIR="/home/forge/seechange-studio/${{ env.ACTIVE }}/data"
-            mkdir -p "${DATA_DIR}"
-            # forge cannot chown to the container user. Keep the directory and let 10001 write it.
-            chmod 0777 "${DATA_DIR}"
-            if [ "$(docker ps -a --format '{{.Names}}' | grep -cx '${{ env.NAME }}')" -gt 0 ]; then
+            if [ ! -d "${DATA_DIR}" ] || [ -L "${DATA_DIR}" ] ||
+               [ "$(stat -c '%u' -- "${DATA_DIR}")" != "$(id -u)" ]; then
+              echo "Deploy preflight failed: /data must be a real directory owned by the deploy user." >&2
+              exit 1
+            fi
+            if ! command -v setfacl >/dev/null || ! command -v getfacl >/dev/null; then
+              echo "Deploy preflight failed: host ACL tools are required to grant UID 10001 access." >&2
+              exit 1
+            fi
+            EXPECTED_ACL=$(printf '%s\n' user::rwx user:10001:rwx group::--- mask::rwx other::---)
+            if [ "$(getfacl -cEn -- "${DATA_DIR}")" != "${EXPECTED_ACL}" ]; then
+              setfacl --set 'u::rwx,u:10001:rwx,g::---,m::rwx,o::---' -- "${DATA_DIR}"
+              setfacl -k -- "${DATA_DIR}"
+            fi
+            if [ "$(getfacl -cEn -- "${DATA_DIR}")" != "${EXPECTED_ACL}" ] ||
+               [ ! -r "${DATA_DIR}" ] || [ ! -w "${DATA_DIR}" ] || [ ! -x "${DATA_DIR}" ]; then
+              echo "Deploy preflight failed: the data directory ACL or deploy user access is incorrect." >&2
+              exit 1
+            fi
+            docker version --format 'Docker server version: {{.Server.Version}}'
+            docker run --rm -i --network none --user 10001:10001 \
+              --mount "type=bind,source=${DATA_DIR},target=/data" \
+              --entrypoint python "${IMAGE_URI}" - <<'PY'
+            import os
+            from pathlib import Path
+            import stat
+            from tempfile import TemporaryFile
+
+            root = Path("/data")
+            backup_bytes = 0
+            for name in ("studio.sqlite3", "studio.sqlite3-wal", "studio.sqlite3-shm"):
+                path = root / name
+                try:
+                    info = path.lstat()
+                except FileNotFoundError:
+                    continue
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or (info.st_uid, info.st_gid) != (10001, 10001)
+                    or not os.access(path, os.R_OK | os.W_OK)
+                ):
+                    raise SystemExit(f"Deploy preflight failed: {name} must be a writable regular file owned by 10001:10001.")
+                backup_bytes += info.st_size
+
+            capacity = os.statvfs(root)
+            available = capacity.f_bavail * capacity.f_frsize
+            print(f"Studio volume free bytes: {available}. SQLite file bytes: {backup_bytes}.")
+            if available <= backup_bytes:
+                raise SystemExit("Deploy preflight failed: insufficient space for a local SQLite backup.")
+            with TemporaryFile(dir=root) as probe:
+                probe.write(b"Studio deployment volume check\n")
+                probe.flush()
+            PY
+            CONTAINERS=$(docker ps -a --format '{{.Names}}')
+            if printf '%s\n' "${CONTAINERS}" | grep -Fxq -- '${{ env.NAME }}'; then
               docker rm -f "${{ env.NAME }}"
             fi
             docker run -d \
               --name "${{ env.NAME }}" \
               --user 10001:10001 \
-              -p "${{ env.OUT_PORT }}:${{ env.PORT }}" \
+              -p "127.0.0.1:${{ env.OUT_PORT }}:${{ env.PORT }}" \
               -v "${DATA_DIR}:/data" \
               --restart unless-stopped \
               --log-driver=awslogs \
