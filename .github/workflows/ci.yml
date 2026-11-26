@@ -115,9 +115,13 @@ jobs:
           host: ${{ env.REMOTE_HOST }}
           username: ${{ vars.REMOTE_USER }}
           key: ${{ secrets.REMOTE_SSH_KEY }}
-          envs: ECR_REGISTRY,ECR_TOKEN,IMAGE_URI
+          envs: ECR_REGISTRY,ECR_TOKEN,IMAGE_URI,RUN_ARGS
           script: |
             set -eu
+            # Split optional Docker flags without shell evaluation or globbing.
+            set -f
+            set -- ${RUN_ARGS:-}
+            set +f
             echo "${ECR_TOKEN}" | docker login --username AWS --password-stdin "${ECR_REGISTRY}"
             docker pull "${IMAGE_URI}"
             DATA_DIR="/home/forge/seechange-studio/${{ env.ACTIVE }}/data"
@@ -181,6 +185,7 @@ jobs:
             docker run -d \
               --name "${{ env.NAME }}" \
               --user 10001:10001 \
+              "$@" \
               -p "127.0.0.1:${{ env.OUT_PORT }}:${{ env.PORT }}" \
               -v "${DATA_DIR}:/data" \
               --restart unless-stopped \
